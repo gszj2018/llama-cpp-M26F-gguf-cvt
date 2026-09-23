@@ -689,6 +689,31 @@ class DFlashModel(Qwen3Model):
         block_size = dflash_config.get("block_size", self.hparams.get("block_size", 16))
         self.gguf_writer.add_block_size(block_size)
 
+        # DFlash partial RoPE
+        partial_rotary = self.rope_parameters.get(
+            "partial_rotary_factor",
+            self.hparams.get("partial_rotary_factor"),
+        )
+
+        if partial_rotary is not None:
+            head_dim = int(
+                self.hparams.get(
+                    "head_dim",
+                    self.hparams["hidden_size"]
+                    // self.hparams["num_attention_heads"],
+                )
+            )
+
+            n_rot = int(head_dim * float(partial_rotary))
+
+            self.gguf_writer.add_rope_dimension_count(n_rot)
+
+            logger.info(
+                f"gguf: DFlash RoPE dimension count = {n_rot} "
+                f"(head_dim={head_dim}, "
+                f"partial_rotary_factor={partial_rotary})"
+            )
+
         if "conv_kernel_size" in dflash_config:
             self.gguf_writer.add_conv_kernel_size(int(dflash_config["conv_kernel_size"]))
             self.gguf_writer.add_conv_group_size(int(dflash_config["conv_group_size"]))
@@ -729,6 +754,11 @@ class DFlashModel(Qwen3Model):
             causal = dflash_config.get("causal")
         if causal is not None:
             self.gguf_writer.add_causal_attention(bool(causal))
+
+        value_scale = dflash_config.get("attention_value_scale")
+        if value_scale is not None:
+            self.gguf_writer.add_attn_value_scale(float(value_scale))
+            logger.info(f"gguf: DFlash attention value scale = {float(value_scale)}")
 
         # M-RoPE target: the draft ropes on the temporal dim only, so write
         # degenerate sections [n_rot/2, 0, 0, 0]
