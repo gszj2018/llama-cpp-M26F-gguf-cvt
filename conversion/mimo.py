@@ -5,18 +5,20 @@ import re
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf
+from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf
 
 
 @ModelBase.register("MiMoV2FlashForCausalLM", "MiMoV2ForCausalLM")
 @ModelBase.example("XiaomiMiMo/MiMo-V2.5")
 class MimoV2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.MIMO2
+    supports_mtp_export = True
 
     # MiMo V2-Flash, V2.5 and V2.5-Pro all ship 3 trained MTP layers under model.mtp.layers.{0,1,2}.
     # The HF config does not expose the count, so it's hardcoded to match the count found in the safetensors.
@@ -25,7 +27,7 @@ class MimoV2Model(TextModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.block_count = self.hparams["num_hidden_layers"] + self._n_nextn
+        self.block_count = self.hparams["num_hidden_layers"] + (0 if self.no_mtp else self._n_nextn)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
     @staticmethod
@@ -101,7 +103,7 @@ class MimoV2Model(TextModel):
         qkv_overrides: dict[str, tuple[Callable, Callable, int]] = {}
         qc = self.hparams.get("quantization_config")
         if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
-            pat = re.compile(r"^model\.layers\.(\d+)\.self_attn\.qkv_proj\.weight_scale_inv$")
+            pat = re.compile(r"^model\.(mtp\.)?layers\.(\d+)\.self_attn\.qkv_proj\.weight_scale_inv$")
             for name in list(self.model_tensors.keys()):
                 m = pat.match(name)
                 if not m:
@@ -109,10 +111,16 @@ class MimoV2Model(TextModel):
                 weight_name = name.removesuffix("_scale_inv")
                 if weight_name not in self.model_tensors:
                     continue
+                is_mtp = m.group(1) is not None
+                bid = int(m.group(2))
+
+                if is_mtp:
+                    bid += self.hparams["num_hidden_layers"]
+
                 qkv_overrides[weight_name] = (
                     self.model_tensors[weight_name],
                     self.model_tensors[name],
-                    int(m.group(1)),
+                    bid,
                 )
 
         super().dequant_model()
@@ -146,7 +154,9 @@ class MimoV2Model(TextModel):
         n_head_kv_swa = self.hparams["swa_num_key_value_heads"]
         # Extend the per-layer pattern with SWA entries for the MTP blocks so the
         # runtime arrays (sized to extended block_count) are fully populated.
-        hybrid = list(self.hparams["hybrid_layer_pattern"]) + [1] * self._n_nextn
+        hybrid = list(self.hparams["hybrid_layer_pattern"])
+        if not self.no_mtp:
+            hybrid += [1] * self._n_nextn
         n_head_kv_arr = [n_head_kv_swa if use_swa == 1 else n_head_kv for use_swa in hybrid]
         self.gguf_writer.add_head_count_kv(n_head_kv_arr)
 
@@ -165,13 +175,18 @@ class MimoV2Model(TextModel):
         if v_scale is not None:
             self.gguf_writer.add_attn_value_scale(float(v_scale))
 
-        self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
+        if not self.no_mtp:
+            self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
 
     _experts: list[dict[str, Tensor]] | None = None
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
+
+        # 兼容旧 llama.cpp：完全跳过 MTP tensors
+        if cls.no_mtp and name.startswith("model.mtp."):
+            return None
 
         if "attention_sink" in name and not name.endswith(".weight"):
             name += ".weight"
@@ -220,8 +235,127 @@ class MimoV2Model(TextModel):
                 return
         yield from super().modify_tensors(data_torch, name, bid)
 
+    def _prepare_mxfp4_experts(self) -> bool:
+        """
+        MiMo-V2.6 stores routed experts as packed MXFP4:
+
+          *.weight        uint8 packed E2M1
+          *.weight_scale  uint8 E8M0 scale
+
+        Repack them directly into GGUF MXFP4 before the generic converter
+        sees them.
+        """
+
+        qc = self.hparams.get("quantization_config") or {}
+
+        # V2.6 declares quant_method=fp8 but the routed experts themselves
+        # use MXFP4 storage.
+        if qc.get("store_dtype") != "mxfp4":
+            return False
+
+        pattern = re.compile(
+            r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+            r"(gate_proj|up_proj|down_proj)\.weight$"
+        )
+
+        groups: dict[tuple[int, str], list[tuple[int, str]]] = {}
+
+        for name in list(self.model_tensors.keys()):
+            m = pattern.match(name)
+            if m is None:
+                continue
+
+            scale_name = name + "_scale"
+            if scale_name not in self.model_tensors:
+                continue
+
+            layer = int(m.group(1))
+            expert = int(m.group(2))
+            proj = m.group(3)
+
+            groups.setdefault((layer, proj), []).append((expert, name))
+
+        if not groups:
+            return False
+
+        n_experts = self.hparams["n_routed_experts"]
+
+        for (layer, proj), entries in sorted(groups.items()):
+            entries.sort(key=lambda x: x[0])
+
+            expert_ids = [expert for expert, _ in entries]
+
+            if expert_ids != list(range(n_experts)):
+                missing = sorted(set(range(n_experts)) - set(expert_ids))
+                raise ValueError(
+                    f"MXFP4 experts incomplete for layer={layer}, proj={proj}: "
+                    f"got {len(entries)}/{n_experts}, missing={missing}"
+                )
+
+            result = None
+
+            for expert, name in entries:
+                scale_name = name + "_scale"
+
+                weight = LazyTorchTensor.to_eager(
+                    self.model_tensors.pop(name)()
+                )
+
+                scale = LazyTorchTensor.to_eager(
+                    self.model_tensors.pop(scale_name)()
+                )
+
+                if weight.dtype != torch.uint8:
+                    raise ValueError(
+                        f"Expected MXFP4 uint8 weight for {name}, "
+                        f"got {weight.dtype}"
+                    )
+
+                if scale.dtype != torch.uint8:
+                    raise ValueError(
+                        f"Expected MXFP4 uint8 scale for {scale_name}, "
+                        f"got {scale.dtype}"
+                    )
+
+                packed = self.repack_mxfp4_blocks(weight, scale)
+
+                if result is None:
+                    result = np.empty(
+                        (n_experts, *packed.shape),
+                        dtype=np.uint8,
+                    )
+
+                result[expert] = packed
+
+            assert result is not None
+
+            merged_name = (
+                f"model.layers.{layer}.mlp.experts.{proj}.weight"
+            )
+
+            new_name = self.map_tensor_name(merged_name)
+
+            print(
+                f"MXFP4 experts: {merged_name} -> {new_name}, "
+                f"shape={result.shape}",
+                flush=True,
+            )
+
+            self.gguf_writer.add_tensor(
+                new_name,
+                result,
+                raw_dtype=gguf.GGMLQuantizationType.MXFP4,
+            )
+
+        return True
+
     def prepare_tensors(self):
+        had_mxfp4_experts = self._prepare_mxfp4_experts()
         super().prepare_tensors()
+
+        if had_mxfp4_experts:
+            self._is_mxfp4 = True
+            self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
 
         if self._experts is not None:
             # flatten `list[dict[str, Tensor]]` into `list[str]`
@@ -382,6 +516,10 @@ class MiMoV2VisionAudioModel(MmprojModel):
             "_codebook.inited",
         )
         for name, tensor in state_dict.items():
+            # Audio-tokenizer decoder is not used by llama.cpp/mtmd.
+            # Only the encoder/RVQ side is exported to mmproj.
+            if name.startswith("decoder."):
+                continue
             if name.endswith(skip_suffixes):
                 continue
             if m := codebook_re.match(name):
