@@ -1,3 +1,33 @@
+# Patched llama.cpp for MiMo-V2.6-Flash checkpoint conversion
+
+## Feature
+
+You can use this `llama.cpp` `v0.4.1` fork to convert [MiMo-V2.6-Flash official checkpoint](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) to GGUF.
+
+Additional features:
+- MTP layers removal (use option `--no-mtp`)
+- Experimental converter for [DFlash drafter](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL/tree/main/dflash)
+
+> NOT for inference. If you need an inference runtime, see [gszj2018/ROCmFPX-M26F](https://github.com/gszj2018/ROCmFPX-M26F/tree/m26f-patch)
+
+## Usage
+
+```bash
+# init venv
+uv sync
+# main model (remove --no-mtp option if you need MTP)
+uv run --no-sync llama-convert-hf-to-gguf --no-mtp /path/to/downloaded/model/dir
+# multimodal projector
+uv run --no-sync llama-convert-hf-to-gguf --mmproj /path/to/downloaded/model/dir
+# DFlash drafter model
+uv run --no-sync ./0mimo-scripts/mimo_fix.py /path/to/downloaded/model/dir
+uv run --no-sync llama-convert-hf-to-gguf \
+    --target-model-dir /path/to/downloaded/model/dir \
+    /path/to/downloaded/model/dir/dflash-llama
+```
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
