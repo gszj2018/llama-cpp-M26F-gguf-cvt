@@ -1,5 +1,11 @@
 # Patched llama.cpp for MiMo-V2.6-Flash checkpoint conversion
 
+## DEPRECATION NOTICE
+
+Use upstream [llama.cpp](https://github.com/ggml-org/llama.cpp)(`v0.5.0`+) instead. This fork is not needed anymore.
+
+DFlash GGUF converted by this fork is **incompatible** with upstream DFlash draft support. Main model is compatible.
+
 ## Feature
 
 You can use this `llama.cpp` `v0.4.1` fork to convert [MiMo-V2.6-Flash official checkpoint](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) to GGUF.
